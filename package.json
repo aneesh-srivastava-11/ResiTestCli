@@ -1,0 +1,22 @@
+{
+  "name": "resitest",
+  "version": "1.0.0",
+  "description": "API Resilience and Load Testing CLI",
+  "main": "index.js",
+  "type": "module",
+  "bin": {
+    "resitest": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js",
+    "test:local": "node index.js run http://localhost:3000 --users 10 --duration 5"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "cli-progress": "^3.12.0",
+    "commander": "^12.0.0",
+    "ora": "^8.0.1"
+  }
+}
