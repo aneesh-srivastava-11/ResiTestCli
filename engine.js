@@ -100,17 +100,32 @@ export class Engine {
       }
 
       const start = performance.now();
+      
+      // Individual request abort controller for timeout handling
+      const requestController = new AbortController();
+      const onAbort = () => requestController.abort();
+      this.abortController.signal.addEventListener('abort', onAbort);
+
+      // Default timeout of 10 seconds per request
+      const timeoutId = setTimeout(() => requestController.abort(), 10000);
+
       try {
         if (shouldFail) {
           throw new Error('Chaos simulated failure 503');
         }
 
-        const res = await fetch(this.config.url, {
+        const fetchOptions = {
           method: this.config.method,
           headers: this.config.headers,
-          body: this.config.body,
-          signal: this.abortController.signal
-        });
+          signal: requestController.signal
+        };
+
+        // Safety: fetch throws TypeError if body is passed on GET/HEAD requests
+        if (this.config.body && !['GET', 'HEAD'].includes(this.config.method)) {
+          fetchOptions.body = this.config.body;
+        }
+
+        const res = await fetch(this.config.url, fetchOptions);
 
         if (res.body) {
            await res.text().catch(()=> {});
@@ -118,12 +133,21 @@ export class Engine {
 
         this.metrics.record(res.status, performance.now() - start);
       } catch (err) {
-        if (err.name === 'AbortError') break; 
-        if (err.message.includes('Chaos')) {
+        if (err.name === 'AbortError') {
+          // If the engine itself stopped, break the loop
+          if (this.abortController.signal.aborted) {
+            break;
+          }
+          // Otherwise, it was a request timeout
+          this.metrics.recordError(new Error('ETIMEDOUT: Request timed out after 10s'), performance.now() - start);
+        } else if (err.message.includes('Chaos')) {
           this.metrics.record(503, performance.now() - start);
         } else {
           this.metrics.recordError(err, performance.now() - start);
         }
+      } finally {
+        clearTimeout(timeoutId);
+        this.abortController.signal.removeEventListener('abort', onAbort);
       }
     }
   }

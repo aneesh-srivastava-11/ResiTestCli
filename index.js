@@ -3,12 +3,12 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import cliProgress from 'cli-progress';
-import ora from 'ora';
 import readline from 'readline';
 
 import { Engine } from './engine.js';
 import { MetricsTracker } from './metrics.js';
 import { isLocalUrl, safeParseJSON, exportResults, formatDuration } from './utils.js';
+import { fetchSwagger, parseOpenApi, interactiveSelect, interactiveInput } from './discover.js';
 
 const program = new Command();
 
@@ -17,6 +17,162 @@ program
   .description('Production-grade API Resilience & Load Testing CLI')
   .version('1.0.0');
 
+// Shared test runner execution function
+async function runTest(config) {
+  // 1. Safety check
+  if (!config.allowExternal && !isLocalUrl(config.url)) {
+    console.log(chalk.yellow(`\n⚠️  WARNING: You are about to load test an external domain: ${config.url}`));
+    const confirmed = await promptConfirm('Are you sure you want to proceed? (y/N): ');
+    if (!confirmed) {
+      console.log(chalk.blue('\nTest aborted by user.'));
+      process.exit(0);
+    }
+  }
+
+  // 2. Setup
+  console.log(chalk.cyan(`\n🚀 Initialize ResiTest against: ${chalk.white.bold(config.url)}`));
+  console.log(chalk.gray(`Method: ${config.method} | Mode: ${config.mode} | Duration: ${config.duration}s | Initial VUs: ${config.users}`));
+  if (config.mode === 'chaos') {
+    console.log(chalk.magenta(`🔥 Chaos Enabled (Fail Rate: ${config.failRate}, Max Delay: ${config.delay}ms)`));
+  }
+  console.log(chalk.green(`💡 Hint: Use Arrow UP/DOWN to dynamically scale virtual users.\n`));
+
+  const metrics = new MetricsTracker();
+  const engine = new Engine(config, metrics);
+
+  // 3. Progress bar setup
+  const progressBar = new cliProgress.SingleBar({
+    format: `[${chalk.cyan('{bar}')}] ${chalk.green('{percentage}%')} | VUs: ${chalk.yellow('{activeVUs}')}/${chalk.gray('{targetVUs}')} | Req: {req} | Err: {err} | RPS: {rps}`,
+    barCompleteChar: '\u2588',
+    barIncompleteChar: '\u2591',
+    hideCursor: true
+  });
+
+  progressBar.start(config.duration, 0, {
+    activeVUs: 0,
+    targetVUs: config.users,
+    req: 0,
+    err: 0,
+    rps: 0
+  });
+
+  // 4. Interactive user controls via stdin
+  readline.emitKeypressEvents(process.stdin);
+  if (process.stdin.isTTY) {
+    process.stdin.setRawMode(true);
+  }
+  const keypressHandler = (str, key) => {
+    if (key.ctrl && key.name === 'c') {
+      engine.stop();
+      cleanupStdin();
+    } else if (key.name === 'up') {
+      engine.setTargetUsers(engine.targetVUs + 1);
+    } else if (key.name === 'down') {
+      engine.setTargetUsers(engine.targetVUs - 1);
+    }
+  };
+  process.stdin.on('keypress', keypressHandler);
+
+  function cleanupStdin() {
+    process.stdin.removeListener('keypress', keypressHandler);
+    if (process.stdin.isTTY) process.stdin.setRawMode(false);
+    process.stdin.pause();
+  }
+
+  // 5. Run Loop
+  let elapsedWholeSeconds = 0;
+  const uiInterval = setInterval(() => {
+    elapsedWholeSeconds++;
+    if (elapsedWholeSeconds > config.duration) elapsedWholeSeconds = config.duration;
+    
+    const p = engine.metrics.summary();
+    progressBar.update(elapsedWholeSeconds, {
+      activeVUs: engine.activeVUs,
+      targetVUs: engine.targetVUs,
+      req: p.totalRequests,
+      err: p.failures,
+      rps: p.requestsPerSecond.toFixed(1)
+    });
+  }, 1000);
+
+  // 6. Execute Engine
+  await engine.run();
+  
+  // 7. Teardown
+  cleanupStdin();
+  clearInterval(uiInterval);
+  progressBar.update(config.duration);
+  progressBar.stop();
+
+  // 8. Generate Summary
+  const finalStats = metrics.summary();
+  const successPercent = finalStats.totalRequests === 0 ? 0 : ((finalStats.successes / finalStats.totalRequests) * 100).toFixed(1);
+  const failPercent = finalStats.totalRequests === 0 ? 0 : ((finalStats.failures / finalStats.totalRequests) * 100).toFixed(1);
+
+  console.log('\n✅ ' + chalk.bold.white('ResiTest Complete'));
+  console.log(chalk.gray('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
+  console.log(`  Mode        : ${config.mode}`);
+  console.log(`  URL         : ${config.url}`);
+  console.log(`  Duration    : ${formatDuration(finalStats.durationMs)}`);
+  console.log('');
+  console.log(`  Total Req   :  ${finalStats.totalRequests}`);
+  console.log(`  Success     :  ${chalk.green(finalStats.successes)}  (${successPercent}%)`);
+  console.log(`  Failures    :  ${finalStats.failures > 0 ? chalk.red(finalStats.failures) : chalk.green('0')}  (${failPercent}%)`);
+  console.log('');
+  console.log(`  Avg Latency : ${formatDuration(finalStats.avgLatency)}`);
+  console.log(`  Max Latency : ${formatDuration(finalStats.maxLatency)}`);
+  console.log(`  P95 Latency : ${formatDuration(finalStats.p95Latency)}`);
+  console.log(`  RPS         : ${finalStats.requestsPerSecond.toFixed(2)} req/s`);
+  
+  if (finalStats.failures > 0) {
+    console.log('');
+    console.log(chalk.yellow('  Error Details:'));
+    for (const [type, count] of Object.entries(finalStats.errorTypes)) {
+      console.log(`    ${type}: ${count}`);
+    }
+  }
+  console.log(chalk.gray('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'));
+
+  // Export if needed
+  if (config.outputFile) {
+    exportResults(finalStats, metrics.getRaw(), config.outputFile);
+    console.log(chalk.green(`📁 Results exported to ${config.outputFile}\n`));
+  }
+  
+  process.exit(0);
+}
+
+// Helpers for method formatting colors
+function getMethodColor(method) {
+  switch (method.toUpperCase()) {
+    case 'GET': return 'green';
+    case 'POST': return 'yellow';
+    case 'PUT': return 'blue';
+    case 'DELETE': return 'red';
+    case 'PATCH': return 'magenta';
+    default: return 'white';
+  }
+}
+
+// Helper for interactive prompt
+function promptConfirm(question) {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  return new Promise((resolve) => {
+    rl.question(question, (answer) => {
+      rl.close();
+      const trimmed = answer.trim().toLowerCase();
+      // Default to true if user just hits enter, or explicitly y/yes
+      const isYes = trimmed === 'y' || trimmed === 'yes' || trimmed === '';
+      resolve(isYes);
+    });
+  });
+}
+
+// Standard RUN command (direct URL execution)
 program
   .command('run <url>')
   .description('Run a load test against the specified URL')
@@ -31,7 +187,6 @@ program
   .option('--allow-external', 'Allow testing external domains without prompt', false)
   .option('-o, --output <file>', 'Export results to file (support .json, .csv)')
   .action(async (url, options) => {
-    // 1. Initial configuration validation
     const config = {
       url,
       mode: options.mode.toLowerCase(),
@@ -50,144 +205,108 @@ program
       console.error(chalk.red(`\n❌ Invalid mode: ${config.mode}. Must be one of spike, constant, chaos.`));
       process.exit(1);
     }
+
+    await runTest(config);
+  });
+
+// New DISCOVER command (interactive Swagger/OpenAPI discovery)
+program
+  .command('discover [url]')
+  .description('Discover endpoints from a Swagger/OpenAPI site URL and test one interactively')
+  .option('-m, --mode <type>', 'Load mode [spike|constant|chaos]', 'constant')
+  .option('-u, --users <number>', 'Number of virtual users (target)', '10')
+  .option('-d, --duration <seconds>', 'Test duration in seconds', '10')
+  .option('-f, --fail-rate <rate>', 'Chaos failure rate (0 to 1)', '0')
+  .option('-l, --delay <ms>', 'Delay between loops or chaos max delay', '0')
+  .option('--allow-external', 'Allow testing external domains without prompt', false)
+  .option('-o, --output <file>', 'Export results to file (support .json, .csv)')
+  .action(async (urlInput, options) => {
+    let url = urlInput;
+    if (!url) {
+      url = await interactiveInput('Enter your testing site base URL or Swagger JSON URL');
+      if (!url) {
+        console.error(chalk.red('❌ A URL is required.'));
+        process.exit(1);
+      }
+    }
+
+    const discoveryResult = await fetchSwagger(url);
+    if (!discoveryResult) {
+      console.error(chalk.red('\n❌ Failed to discover Swagger/OpenAPI endpoints. Make sure the site is running and exposing an OpenAPI endpoint.'));
+      process.exit(1);
+    }
+
+    const { doc, baseUrl } = discoveryResult;
+    const endpoints = parseOpenApi(doc);
+
+    if (endpoints.length === 0) {
+      console.error(chalk.red('❌ No valid REST API endpoints found in the documentation.'));
+      process.exit(1);
+    }
+
+    // Format choices for selector menu
+    const choices = endpoints.map(ep => {
+      const summaryText = ep.summary ? ` - ${chalk.gray(ep.summary)}` : '';
+      const methodColor = getMethodColor(ep.method);
+      const coloredMethod = chalk[methodColor](ep.method.padEnd(7));
+      return `${coloredMethod} ${ep.path}${summaryText}`;
+    });
+
+    const selectedIndex = await interactiveSelect('Select an endpoint to load test:', choices);
+    const endpoint = endpoints[selectedIndex];
+
+    // Build the request URL (substitute path parameters, append query parameters)
+    let finalUrl;
+    try {
+      finalUrl = new URL(endpoint.mockPath, baseUrl).toString();
+      if (Object.keys(endpoint.queryParams).length > 0) {
+        const urlObj = new URL(finalUrl);
+        for (const [key, val] of Object.entries(endpoint.queryParams)) {
+          urlObj.searchParams.append(key, val);
+        }
+        finalUrl = urlObj.toString();
+      }
+    } catch (err) {
+      // Direct concatenation fallback if URL parsing fails
+      const pathConcat = endpoint.mockPath.startsWith('/') ? endpoint.mockPath.slice(1) : endpoint.mockPath;
+      finalUrl = baseUrl.endsWith('/') ? `${baseUrl}${pathConcat}` : `${baseUrl}/${pathConcat}`;
+    }
+
+    console.log(chalk.cyan(`\n🎯 Selected Endpoint: ${chalk.white.bold(`${endpoint.method} ${endpoint.path}`)}`));
+    console.log(chalk.cyan(`🔗 Target Request URL: ${chalk.white(finalUrl)}`));
     
-    // Safety check
-    if (!config.allowExternal && !isLocalUrl(url)) {
-      console.log(chalk.yellow(`\n⚠️  WARNING: You are about to load test an external domain: ${url}`));
-      const confirmed = await promptConfirm('Are you sure you want to proceed? (y/N): ');
-      if (!confirmed) {
-        console.log(chalk.blue('\nTest aborted by user.'));
-        process.exit(0);
-      }
+    if (endpoint.body) {
+      console.log(chalk.cyan(`📦 Auto-generated Mock Payload:`));
+      console.log(chalk.gray(JSON.stringify(JSON.parse(endpoint.body), null, 2)));
+    } else {
+      console.log(chalk.cyan(`📦 Payload: None`));
     }
 
-    // 2. Setup
-    console.log(chalk.cyan(`\n🚀 Initialize ResiTest against: ${chalk.white.bold(url)}`));
-    console.log(chalk.gray(`Mode: ${config.mode} | Duration: ${config.duration}s | Initial VUs: ${config.users}`));
-    if (config.mode === 'chaos') {
-      console.log(chalk.magenta(`🔥 Chaos Enabled (Fail Rate: ${config.failRate}, Max Delay: ${config.delay}ms)`));
+    const confirmRun = await promptConfirm('\nDo you want to start the load test with these settings? (Y/n) ');
+    if (!confirmRun) {
+      console.log(chalk.blue('\nTest aborted by user.'));
+      process.exit(0);
     }
-    console.log(chalk.green(`💡 Hint: Use Arrow UP/DOWN to dynamically scale virtual users.\n`));
 
-    const metrics = new MetricsTracker();
-    const engine = new Engine(config, metrics);
-
-    // 3. Progress bar setup
-    const progressBar = new cliProgress.SingleBar({
-      format: `[${chalk.cyan('{bar}')}] ${chalk.green('{percentage}%')} | VUs: ${chalk.yellow('{activeVUs}')}/${chalk.gray('{targetVUs}')} | Req: {req} | Err: {err} | RPS: {rps}`,
-      barCompleteChar: '\u2588',
-      barIncompleteChar: '\u2591',
-      hideCursor: true
-    });
-
-    progressBar.start(config.duration, 0, {
-      activeVUs: 0,
-      targetVUs: config.users,
-      req: 0,
-      err: 0,
-      rps: 0
-    });
-
-    // 4. Interactive user controls via stdin
-    readline.emitKeypressEvents(process.stdin);
-    if (process.stdin.isTTY) {
-      process.stdin.setRawMode(true);
-    }
-    const keypressHandler = (str, key) => {
-      if (key.ctrl && key.name === 'c') {
-        engine.stop();
-        cleanupStdin();
-      } else if (key.name === 'up') {
-        engine.setTargetUsers(engine.targetVUs + 1);
-      } else if (key.name === 'down') {
-        engine.setTargetUsers(engine.targetVUs - 1);
-      }
+    const config = {
+      url: finalUrl,
+      mode: options.mode.toLowerCase(),
+      users: parseInt(options.users, 10) || 10,
+      duration: parseInt(options.duration, 10) || 10,
+      failRate: parseFloat(options.failRate) || 0,
+      delay: parseInt(options.delay, 10) || 0,
+      method: endpoint.method,
+      allowExternal: options.allowExternal,
+      outputFile: options.output,
+      headers: { ...endpoint.headers },
+      body: endpoint.body
     };
-    process.stdin.on('keypress', keypressHandler);
 
-    function cleanupStdin() {
-      process.stdin.removeListener('keypress', keypressHandler);
-      if (process.stdin.isTTY) process.stdin.setRawMode(false);
-      process.stdin.pause();
+    if (endpoint.body) {
+      config.headers['Content-Type'] = 'application/json';
     }
 
-    // 5. Run Loop
-    let elapsedWholeSeconds = 0;
-    const uiInterval = setInterval(() => {
-      elapsedWholeSeconds++;
-      if (elapsedWholeSeconds > config.duration) elapsedWholeSeconds = config.duration;
-      
-      const p = engine.metrics.summary();
-      progressBar.update(elapsedWholeSeconds, {
-        activeVUs: engine.activeVUs,
-        targetVUs: engine.targetVUs,
-        req: p.totalRequests,
-        err: p.failures,
-        rps: p.requestsPerSecond.toFixed(1)
-      });
-    }, 1000);
-
-    // 6. Execute Engine
-    await engine.run();
-    
-    // 7. Teardown
-    cleanupStdin();
-    clearInterval(uiInterval);
-    progressBar.update(config.duration);
-    progressBar.stop();
-
-    // 8. Generate Summary
-    const finalStats = metrics.summary();
-    const successPercent = finalStats.totalRequests === 0 ? 0 : ((finalStats.successes / finalStats.totalRequests) * 100).toFixed(1);
-    const failPercent = finalStats.totalRequests === 0 ? 0 : ((finalStats.failures / finalStats.totalRequests) * 100).toFixed(1);
-
-    console.log('\n✅ ' + chalk.bold.white('ResiTest Complete'));
-    console.log(chalk.gray('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'));
-    console.log(`  Mode        : ${config.mode}`);
-    console.log(`  URL         : ${url}`);
-    console.log(`  Duration    : ${formatDuration(finalStats.durationMs)}`);
-    console.log('');
-    console.log(`  Total Req   :  ${finalStats.totalRequests}`);
-    console.log(`  Success     :  ${chalk.green(finalStats.successes)}  (${successPercent}%)`);
-    console.log(`  Failures    :  ${finalStats.failures > 0 ? chalk.red(finalStats.failures) : chalk.green('0')}  (${failPercent}%)`);
-    console.log('');
-    console.log(`  Avg Latency : ${formatDuration(finalStats.avgLatency)}`);
-    console.log(`  Max Latency : ${formatDuration(finalStats.maxLatency)}`);
-    console.log(`  P95 Latency : ${formatDuration(finalStats.p95Latency)}`);
-    console.log(`  RPS         : ${finalStats.requestsPerSecond.toFixed(2)} req/s`);
-    
-    if (finalStats.failures > 0) {
-      console.log('');
-      console.log(chalk.yellow('  Error Details:'));
-      for (const [type, count] of Object.entries(finalStats.errorTypes)) {
-        console.log(`    ${type}: ${count}`);
-      }
-    }
-    console.log(chalk.gray('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n'));
-
-    // Export if needed
-    if (config.outputFile) {
-      exportResults(finalStats, metrics.getRaw(), config.outputFile);
-      console.log(chalk.green(`📁 Results exported to ${config.outputFile}\n`));
-    }
-    
-    process.exit(0);
+    await runTest(config);
   });
 
 program.parse(process.argv);
-
-// Helper for interactive prompt
-function promptConfirm(question) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout
-  });
-
-  return new Promise((resolve) => {
-    rl.question(question, (answer) => {
-      rl.close();
-      const isYes = answer.trim().toLowerCase() === 'y' || answer.trim().toLowerCase() === 'yes';
-      resolve(isYes);
-    });
-  });
-}
