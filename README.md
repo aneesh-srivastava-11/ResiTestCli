@@ -21,18 +21,18 @@ ResiTest is a production-grade, asynchronous command-line (CLI) load and resilie
 
 You can install ResiTest in your terminal or on other machines using one of the following methods:
 
-### Method A: Direct Installation via Git (Easiest for internal use)
+### Method A: Install via npm Registry (Recommended)
+Anyone can install ResiTest globally directly from the npm registry:
+```bash
+npm install -g resitest
+```
+
+### Method B: Direct Installation via Git (Easiest for internal/source use)
 If the project is hosted in a repository, any user with Node.js installed can install it globally via:
 ```bash
 npm install -g git+https://github.com/<your-username>/ResiTestCli.git
 ```
 *(Replace `<your-username>` with the target repository's URL or username).*
-
-### Method B: Install via npm Registry (After publishing)
-Once the package has been published to the npm repository (`npm publish`), anyone can install it globally via:
-```bash
-npm install -g resitest
-```
 
 ### Method C: Clone & Link (Best for development and testing)
 1. Clone the repository:

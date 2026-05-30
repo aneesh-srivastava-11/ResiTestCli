@@ -151,18 +151,18 @@ The terminal progress bar will immediately reflect the new active VU count, curr
 
 To install and run ResiTest on another machine or team member's terminal, you can choose one of the following methods:
 
-### Method A: Direct Installation via Git (Easiest for internal use)
+### Method A: Install via npm Registry (Recommended)
+Anyone can install ResiTest globally directly from the npm registry:
+```bash
+npm install -g resitest
+```
+
+### Method B: Direct Installation via Git (Easiest for internal use)
 If the codebase is hosted on GitHub or another remote repository, any user with Node.js installed can install it globally without publishing to the public npm registry:
 ```bash
 npm install -g git+https://github.com/<your-username>/ResiTestCli.git
 ```
 *(Replace `<your-username>` with the target repository's URL or username).*
-
-### Method B: Install via npm Registry (After publishing)
-Once the package has been published to the npm repository (`npm publish`), anyone can install it globally via:
-```bash
-npm install -g resitest
-```
 
 ### Method C: Clone & Link (Best for development and testing)
 If they have access to the source code files:
