@@ -36,8 +36,12 @@ export class MetricsTracker {
     this.failures++;
     this.latencies.push(latencyMs);
 
-    // Simplistic error categorization
-    let code = err.cause?.code || err.code || err.name || 'UNKNOWN';
+    let code = 'UNKNOWN';
+    if (err && typeof err === 'object') {
+      code = err.cause?.code || err.code || err.name || 'UNKNOWN';
+    } else if (typeof err === 'string') {
+      code = err;
+    }
     this.errorTypes.set(code, (this.errorTypes.get(code) || 0) + 1);
   }
 

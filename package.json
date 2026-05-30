@@ -1,17 +1,35 @@
 {
   "name": "resitest",
   "version": "1.0.0",
-  "description": "API Resilience and Load Testing CLI",
-  "main": "index.js",
+  "description": "Production-grade CLI tool for API resilience, load testing, SLA validation, and Swagger endpoint discovery",
+  "main": "./bin/resitest.js",
   "type": "module",
   "bin": {
-    "resitest": "./index.js"
+    "resitest": "./bin/resitest.js"
   },
   "scripts": {
-    "start": "node index.js",
-    "test:local": "node index.js run http://localhost:3000 --users 10 --duration 5"
+    "start": "node bin/resitest.js",
+    "test:local": "node bin/resitest.js run http://localhost:3000 --users 10 --duration 5",
+    "postinstall": "node bin/postinstall.js"
   },
-  "author": "",
+  "keywords": [
+    "load-testing",
+    "performance-testing",
+    "resilience-testing",
+    "sla-validation",
+    "swagger",
+    "openapi",
+    "cli",
+    "concurrency"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "author": "Aneesh Srivastava",
   "license": "ISC",
   "dependencies": {
     "chalk": "^5.3.0",
